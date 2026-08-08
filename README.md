@@ -128,6 +128,8 @@ const DEFAULT_SETTINGS = {
   smsPhone: "0622659733",
   smsWebhookUrl: "",
   smsAutoNotify: false,
+  pushNotifyEnabled: false,
+  expiryWarnDays: 7,
 };
 
 const EMPTY_DRAFT = {
@@ -412,6 +414,9 @@ export default function InventoryApp() {
   const [editingStockId, setEditingStockId] = useState(null);
   const [editingStockValue, setEditingStockValue] = useState("");
   const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | saved | error
+  const [notifiedCriticalIds, setNotifiedCriticalIds] = useState([]); // productId ที่แจ้งเตือนสต็อกหมด/ใกล้หมดไปแล้ว (จนกว่าจะกลับมาปกติ)
+  const [notifiedLotIds, setNotifiedLotIds] = useState([]); // lot id ที่แจ้งเตือนวันหมดอายุไปแล้ว
+  const [notifPermission, setNotifPermission] = useState(typeof Notification !== "undefined" ? Notification.permission : "unsupported");
   const [lastSavedAt, setLastSavedAt] = useState(null);
 
   async function withRetry(fn, retries = 2) {
@@ -440,6 +445,10 @@ export default function InventoryApp() {
       const l = await withRetry(() => window.storage.get("fy-log", false));
       if (l) setLog(JSON.parse(l.value));
     } catch (e) { /* no saved log yet */ }
+    try {
+      const n = await withRetry(() => window.storage.get("fy-notified-lots", false));
+      if (n) setNotifiedLotIds(JSON.parse(n.value));
+    } catch (e) { /* none yet */ }
     setLoaded(true);
   }, []);
 
@@ -462,6 +471,7 @@ export default function InventoryApp() {
   useEffect(() => { if (loaded) persist("fy-products", products); }, [products, loaded, persist]);
   useEffect(() => { if (loaded) persist("fy-settings", settings); }, [settings, loaded, persist]);
   useEffect(() => { if (loaded) persist("fy-log", log); }, [log, loaded, persist]);
+  useEffect(() => { if (loaded) persist("fy-notified-lots", notifiedLotIds); }, [notifiedLotIds, loaded, persist]);
 
   function retryPersistNow() {
     persist("fy-products", products);
@@ -641,6 +651,19 @@ export default function InventoryApp() {
     }
   }
 
+  // แจ้งเตือนแบบ Push ผ่านเบราว์เซอร์ (Web Notification API) — ใช้ได้เมื่อเปิดแท็บนี้ทิ้งไว้และได้รับอนุญาตแล้วเท่านั้น
+  // บน iPad/iPhone (Safari) หรือเมื่อเปิดผ่านหน้าต่างแชทที่ฝังอยู่ มักใช้ไม่ได้เลยเพราะข้อจำกัดของแพลตฟอร์ม — ดูคำอธิบายในหน้าตั้งค่า
+  function notifyBrowser(title, body) {
+    try {
+      if (typeof Notification === "undefined") return false;
+      if (Notification.permission !== "granted") return false;
+      new Notification(title, { body, icon: undefined });
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function copyMessage(text) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(
@@ -751,6 +774,61 @@ export default function InventoryApp() {
     [allLots, settings.expiryWarnDays]
   );
 
+  function requestPushPermission() {
+    if (typeof Notification === "undefined") { setNotifPermission("unsupported"); return; }
+    Notification.requestPermission().then((perm) => setNotifPermission(perm));
+  }
+
+  // ปุ่ม "แจ้งเตือนตอนนี้" — สรุปสต็อกหมด/ใกล้หมด + ล็อตใกล้หมดอายุ ส่งทั้ง Push (ถ้าได้รับอนุญาต) และ LINE (ช่องทางที่ใช้งานได้จริงบน iPad วันนี้)
+  function notifyNow() {
+    const expiringLots = allLots.filter((l) => l.expiryDate && daysUntil(l.expiryDate) !== null && daysUntil(l.expiryDate) <= (settings.expiryWarnDays ?? 7));
+    if (criticalItems.length === 0 && expiringLots.length === 0) {
+      setToast("ตอนนี้ไม่มีสินค้าหมด/ใกล้หมด หรือใกล้หมดอายุ");
+      return;
+    }
+    const parts = [];
+    if (criticalItems.length > 0) parts.push(`สต็อกหมด/ใกล้หมด ${criticalItems.length} รายการ: ${criticalItems.map((p) => p.name).join(", ")}`);
+    if (expiringLots.length > 0) parts.push(`ใกล้หมดอายุ ${expiringLots.length} ล็อต: ${expiringLots.map((l) => `${l.product.name} (${l.expiryDate})`).join(", ")}`);
+    const body = parts.join("\n");
+    const pushed = notifyBrowser(`${BRAND} — แจ้งเตือนสต็อก`, body);
+    sendLineNotify(`🔔 แจ้งเตือนสต็อก\n${body}`);
+    addLog({ type: "line_alert", message: `🔔 แจ้งเตือนสต็อกด้วยตนเอง — ${body}`, status: "order" });
+    setToast(pushed ? "ส่งแจ้งเตือนแล้ว (Push + LINE)" : "ส่งแจ้งเตือนผ่าน LINE แล้ว (Push บนอุปกรณ์นี้ใช้ไม่ได้ — ดูวิธีตั้งค่าที่หน้าตั้งค่า)");
+    setHasUpdates(true);
+  }
+
+  // แจ้งเตือนอัตโนมัติเมื่อมีสินค้ากลายเป็นสถานะวิกฤต (หมด/ใกล้หมด) รายการใหม่ที่ยังไม่เคยแจ้ง
+  useEffect(() => {
+    if (!loaded) return;
+    const currentIds = criticalItems.map((p) => p.id);
+    const newOnes = criticalItems.filter((p) => !notifiedCriticalIds.includes(p.id));
+    if (newOnes.length > 0) {
+      const body = newOnes.map((p) => `${p.name} (${STATUS_META[metricsById[p.id].status].label})`).join(", ");
+      notifyBrowser(`${BRAND} — สต็อกหมด/ใกล้หมด`, body);
+      if (settings.pushNotifyEnabled) sendLineNotify(`🔔 สต็อกหมด/ใกล้หมด: ${body}`);
+    }
+    // เก็บเฉพาะ id ที่ยังวิกฤตอยู่ + ของใหม่ที่เพิ่งแจ้ง (ของที่กลับมาปกติแล้วจะถูกลบออก ทำให้แจ้งซ้ำได้ใหม่ถ้าวิกฤตอีกครั้ง)
+    setNotifiedCriticalIds(currentIds);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [criticalItems.map((p) => p.id).join(","), loaded]);
+
+  // แจ้งเตือนอัตโนมัติเมื่อมีล็อตใกล้หมดอายุ/หมดอายุแล้วที่ยังไม่เคยแจ้ง
+  useEffect(() => {
+    if (!loaded) return;
+    const expiring = allLots.filter((l) => l.expiryDate && daysUntil(l.expiryDate) !== null && daysUntil(l.expiryDate) <= (settings.expiryWarnDays ?? 7));
+    const newOnes = expiring.filter((l) => !notifiedLotIds.includes(l.id));
+    if (newOnes.length > 0) {
+      const body = newOnes.map((l) => {
+        const d = daysUntil(l.expiryDate);
+        return `${l.product.name} ${d < 0 ? `หมดอายุแล้ว ${Math.abs(d)} วัน` : `เหลืออีก ${d} วัน`}`;
+      }).join(", ");
+      notifyBrowser(`${BRAND} — สินค้าใกล้หมดอายุ`, body);
+      if (settings.pushNotifyEnabled) sendLineNotify(`⏰ สินค้าใกล้หมดอายุ: ${body}`);
+      setNotifiedLotIds((ids) => [...new Set([...ids, ...newOnes.map((l) => l.id)])]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allLots.map((l) => l.id).join(","), loaded]);
+
   function goHome() {
     setShowSummary(false);
     setTab("dashboard");
@@ -848,16 +926,16 @@ export default function InventoryApp() {
               </button>
             )}
             <button
-              onClick={() => { setTab("log"); }}
-              title={criticalItems.length > 0 ? `${criticalItems.length} รายการต้องสั่งซื้อด่วน` : "การแจ้งเตือน"}
+              onClick={() => { notifyNow(); setTab("log"); }}
+              title={criticalItems.length > 0 ? `แตะเพื่อส่งแจ้งเตือนตอนนี้ — ${criticalItems.length} รายการต้องสั่งซื้อด่วน` : "แตะเพื่อส่งแจ้งเตือนตอนนี้"}
               className={`relative flex items-center justify-center rounded-full border w-8 h-8 ${
-                criticalItems.length > 0 ? "border-[#D6432C] bg-[#D6432C] text-white" : "border-[#4A3549] text-[#D9C9DA]"
+                criticalItems.length > 0 || expiringSoonCount > 0 ? "border-[#D6432C] bg-[#D6432C] text-white" : "border-[#4A3549] text-[#D9C9DA]"
               }`}
             >
               <Bell size={14} />
-              {alertLog.length > 0 && (
+              {(alertLog.length > 0 || expiringSoonCount > 0) && (
                 <span className="absolute -top-1.5 -right-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#D6432C] px-1 text-[9px] font-bold text-white tabular ring-2 ring-[#2B1E2A]">
-                  {alertLog.length}
+                  {criticalItems.length + expiringSoonCount}
                 </span>
               )}
             </button>
@@ -1699,6 +1777,9 @@ export default function InventoryApp() {
           undoStack={undoStack}
           undoLast={undoLast}
           pushUndo={pushUndo}
+          notifPermission={notifPermission}
+          onRequestPushPermission={requestPushPermission}
+          onTestPush={() => notifyBrowser(`${BRAND} — ทดสอบการแจ้งเตือน`, "ถ้าเห็นข้อความนี้ แปลว่า Push Notification ใช้งานได้บนอุปกรณ์นี้")}
         />
       )}
 
@@ -1878,7 +1959,7 @@ function TestSmsButton({ settings }) {
   );
 }
 
-function SettingsModal({ settings, setSettings, onClose, onReset, onHome, undoStack, undoLast, pushUndo }) {
+function SettingsModal({ settings, setSettings, onClose, onReset, onHome, undoStack, undoLast, pushUndo, notifPermission, onRequestPushPermission, onTestPush }) {
   const [draft, setDraft] = useState({ ...settings, orderTemplates: { ...settings.orderTemplates } });
 
   function confirm() {
@@ -1917,6 +1998,44 @@ function SettingsModal({ settings, setSettings, onClose, onReset, onHome, undoSt
             <input type="number" step={f.step} value={draft[f.key]} onChange={(e) => setDraft((d) => ({ ...d, [f.key]: Number(e.target.value) }))} className={inputCls} />
           </Field>
         ))}
+
+        <div className="mt-1 mb-2 border-t border-[#EFE8E0] pt-3.5">
+          <p className="text-xs font-medium text-[#2B1E2A] mb-2.5 flex items-center gap-1.5">
+            <Bell size={13} /> การแจ้งเตือนแบบ Push (สต็อกหมด/ใกล้หมด + ใกล้หมดอายุ)
+          </p>
+          <div className="rounded-lg bg-[#FBF1DF] border border-[#C98A22]/30 px-3 py-2.5 mb-3">
+            <p className="text-[10px] text-[#6B5B69] leading-relaxed">
+              ⚠️ Push Notification ของเบราว์เซอร์ทำงานได้เฉพาะตอนเปิดหน้านี้ทิ้งไว้ในเบราว์เซอร์ (ไม่ใช่ปิดแอปแล้วเด้งขึ้นมาได้เอง) และ<b>บน iPad/iPhone (Safari) มักใช้ไม่ได้เลย</b>ถ้าเปิดผ่านหน้าต่างแชทที่ฝังแอปนี้ไว้ — วิธีที่การันตีว่าจะมีข้อความเด้งขึ้นจริงบน iPad วันนี้คือผ่าน<b>แอป LINE</b> (ตั้งค่าไว้ด้านล่างแล้ว) เพราะ LINE เป็นแอปจริงที่ส่ง Push ของตัวเองได้ปกติ
+            </p>
+          </div>
+          <div className="flex items-center gap-2 mb-3 flex-wrap">
+            <button
+              type="button"
+              onClick={onRequestPushPermission}
+              disabled={notifPermission === "granted"}
+              className="flex items-center gap-1.5 rounded-full border border-[#4F9D8D] px-3 py-2 text-xs font-medium text-[#4F9D8D]"
+            >
+              <Bell size={13} /> {notifPermission === "granted" ? "อนุญาตแล้ว" : notifPermission === "unsupported" ? "อุปกรณ์นี้ไม่รองรับ" : "ขออนุญาตแจ้งเตือน"}
+            </button>
+            {notifPermission === "granted" && (
+              <button type="button" onClick={onTestPush} className="flex items-center gap-1.5 rounded-full border border-[#E4DCD1] px-3 py-2 text-xs font-medium text-[#6B5B69]">
+                <Send size={13} /> ทดสอบ Push
+              </button>
+            )}
+          </div>
+          <Field label="แจ้งเตือนล่วงหน้าก่อนหมดอายุ (วัน)">
+            <input type="number" min={0} value={draft.expiryWarnDays} onChange={(e) => setDraft((d) => ({ ...d, expiryWarnDays: Number(e.target.value) }))} className={inputCls} />
+          </Field>
+          <label className="flex items-center gap-2 mb-1 text-xs text-[#6B5B69]">
+            <input
+              type="checkbox"
+              checked={draft.pushNotifyEnabled}
+              onChange={(e) => setDraft((d) => ({ ...d, pushNotifyEnabled: e.target.checked }))}
+              className="h-4 w-4 rounded border-[#E4DCD1]"
+            />
+            ส่งแจ้งเตือนสต็อกหมด/ใกล้หมด และใกล้หมดอายุ เข้า LINE อัตโนมัติด้วย (นอกเหนือจากตอนถึงจุด ROP)
+          </label>
+        </div>
 
         <div className="mt-1 mb-2 border-t border-[#EFE8E0] pt-3.5">
           <p className="text-xs font-medium text-[#2B1E2A] mb-2.5 flex items-center gap-1.5">
